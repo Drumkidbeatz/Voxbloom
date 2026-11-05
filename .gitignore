@@ -1,0 +1,8 @@
+build/
+cmake-build-*/
+demos/
+*.log
+ui.png
+.DS_Store
+.vs/
+.idea/
