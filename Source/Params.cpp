@@ -57,6 +57,24 @@ const juce::StringArray& delayModeNames()
     return names;
 }
 
+const juce::StringArray& shimmerPitchNames()
+{
+    static const juce::StringArray names { "-12 st", "-7 st", "-5 st", "+5 st", "+7 st", "+12 st" };
+    return names;
+}
+
+float shimmerSemitones (int index)
+{
+    static constexpr float semis[] { -12.0f, -7.0f, -5.0f, 5.0f, 7.0f, 12.0f };
+    return semis[juce::jlimit (0, (int) std::size (semis) - 1, index)];
+}
+
+const juce::StringArray& sweepModeNames()
+{
+    static const juce::StringArray names { "LFO", "Envelope" };
+    return names;
+}
+
 juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
 {
     using namespace juce;
@@ -72,7 +90,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
                      makeFloat (pid::delayHighCut, "Delay High Cut", skewed (1000.0f, 20000.0f, 5000.0f), 6000.0f, formatHz),
                      makeFloat (pid::delayDrive, "Drive", { 0.0f, 100.0f }, 15.0f, formatPercent),
                      makeFloat (pid::delayWobble, "Wobble", { 0.0f, 100.0f }, 10.0f, formatPercent),
-                     makeFloat (pid::delayLevel, "Delay Level", { 0.0f, 100.0f }, 60.0f, formatPercent));
+                     makeFloat (pid::delayLevel, "Delay Level", { 0.0f, 100.0f }, 60.0f, formatPercent),
+                     makeFloat (pid::shimmerAmount, "Shimmer", { 0.0f, 100.0f }, 0.0f, formatPercent),
+                     std::make_unique<AudioParameterChoice> (ParameterID { pid::shimmerPitch, 1 }, "Shimmer Pitch", shimmerPitchNames(), 5),
+                     makeFloat (pid::lofi, "Lo-Fi", { 0.0f, 100.0f }, 0.0f, formatPercent));
 
     auto reverb = std::make_unique<AudioProcessorParameterGroup> ("reverb", "Reverb", " | ");
     reverb->addChild (makeFloat (pid::reverbSize, "Size", { 0.0f, 100.0f }, 70.0f, formatPercent),
@@ -82,7 +103,26 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
                       makeFloat (pid::reverbLowCut, "Reverb Low Cut", skewed (20.0f, 1000.0f, 200.0f), 200.0f, formatHz),
                       makeFloat (pid::reverbMod, "Modulation", { 0.0f, 100.0f }, 30.0f, formatPercent),
                       makeFloat (pid::reverbLevel, "Reverb Level", { 0.0f, 100.0f }, 45.0f, formatPercent),
-                      makeFloat (pid::reverbSource, "Delay > Reverb", { 0.0f, 100.0f }, 40.0f, formatPercent));
+                      makeFloat (pid::reverbSource, "Delay > Reverb", { 0.0f, 100.0f }, 40.0f, formatPercent),
+                      makeFloat (pid::reverse, "Reverse", { 0.0f, 100.0f }, 0.0f, formatPercent),
+                      makeFloat (pid::reverseTime, "Reverse Time", skewed (100.0f, 2000.0f, 500.0f), 500.0f, formatMs));
+
+    auto sweep = std::make_unique<AudioProcessorParameterGroup> ("sweep", "Sweep", " | ");
+    sweep->addChild (std::make_unique<AudioParameterChoice> (ParameterID { pid::sweepMode, 1 }, "Sweep Mode", sweepModeNames(), 0),
+                     makeFloat (pid::sweepRate, "Sweep Rate", skewed (0.05f, 10.0f, 1.0f), 0.5f,
+                                [] (float v, int) { return juce::String (v, v < 1.0f ? 2 : 1) + " Hz"; }),
+                     makeFloat (pid::sweepDepth, "Sweep Depth", { 0.0f, 100.0f }, 0.0f, formatPercent));
+
+    auto gate = std::make_unique<AudioProcessorParameterGroup> ("gate", "Gate", " | ");
+    gate->addChild (makeFloat (pid::gateAmount, "Gate", { 0.0f, 100.0f }, 0.0f, formatPercent),
+                    makeFloat (pid::gateThreshold, "Gate Threshold", { -60.0f, 0.0f }, -35.0f, formatDb),
+                    makeFloat (pid::gateHold, "Gate Hold", skewed (20.0f, 2000.0f, 250.0f), 250.0f, formatMs));
+
+    auto perform = std::make_unique<AudioProcessorParameterGroup> ("perform", "Perform", " | ");
+    perform->addChild (std::make_unique<AudioParameterBool> (ParameterID { pid::freeze, 1 }, "Freeze", false),
+                       std::make_unique<AudioParameterBool> (ParameterID { pid::throwMode, 1 }, "Throw Mode", false),
+                       std::make_unique<AudioParameterBool> (ParameterID { pid::throwActive, 1 }, "Throw", false),
+                       makeFloat (pid::doubler, "Doubler", { 0.0f, 100.0f }, 0.0f, formatPercent));
 
     auto duck = std::make_unique<AudioProcessorParameterGroup> ("duck", "Ducking", " | ");
     duck->addChild (makeFloat (pid::duckAmount, "Duck Amount", { 0.0f, 100.0f }, 50.0f, formatPercent),
@@ -94,7 +134,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
                    makeFloat (pid::mix, "Mix", { 0.0f, 100.0f }, 35.0f, formatPercent),
                    makeFloat (pid::output, "Output", { -24.0f, 12.0f }, 0.0f, formatDb));
 
-    layout.add (std::move (delay), std::move (reverb), std::move (duck), std::move (out));
+    layout.add (std::move (delay), std::move (reverb), std::move (sweep), std::move (gate),
+                std::move (duck), std::move (perform), std::move (out));
     return layout;
 }
 }

@@ -32,6 +32,7 @@ namespace vb::dsp
 
             lengthGlide = smoothingCoeff (0.35, sampleRate);
             preGlide    = smoothingCoeff (0.08, sampleRate);
+            freezeGlide = smoothingCoeff (0.06, sampleRate);
             reset();
         }
 
@@ -45,6 +46,7 @@ namespace vb::dsp
             hpL1.reset(); hpL2.reset(); hpR1.reset(); hpR2.reset();
             currentLengths = targetLengths;
             currentPre = targetPre;
+            freezeAmount = freezeTarget;
             for (size_t i = 0; i < phases.size(); ++i)
                 phases[i] = (double) i * 0.79;
         }
@@ -62,6 +64,10 @@ namespace vb::dsp
             for (auto* f : { &hpL1, &hpL2, &hpR1, &hpR2 }) f->setCutoff (lowCutHz, sampleRate);
             modDepth = juce::jlimit (0.0f, 1.0f, mod01) * 0.0011f * (float) sampleRate;
         }
+
+        /** Freeze: the tail sustains forever and takes no new input. */
+        void setFreeze (bool shouldFreeze) noexcept { freezeTarget = shouldFreeze ? 1.0f : 0.0f; }
+        bool isFrozen() const noexcept { return freezeAmount > 0.5f; }
 
         void process (const float* inL, const float* inR, float* outL, float* outR, int numSamples) noexcept
         {
@@ -82,8 +88,10 @@ namespace vb::dsp
             for (int n = 0; n < numSamples; ++n)
             {
                 currentPre += (targetPre - currentPre) * preGlide;
-                auto xL = preL.read (currentPre);
-                auto xR = preR.read (currentPre);
+                freezeAmount += (freezeTarget - freezeAmount) * freezeGlide;
+                const auto inGain = 1.0f - freezeAmount;
+                auto xL = preL.read (currentPre) * inGain;
+                auto xR = preR.read (currentPre) * inGain;
                 preL.write (inL[n]);
                 preR.write (inR[n]);
 
@@ -99,7 +107,10 @@ namespace vb::dsp
                     phases[i] += twoPi * rates[i] / sampleRate;
                     if (phases[i] > twoPi) phases[i] -= twoPi;
 
-                    r[i] = damp[i].lowpass (lines[i].read (currentLengths[i] + mod)) * gains[i];
+                    const auto raw = lines[i].read (currentLengths[i] + mod);
+                    const auto damped = damp[i].lowpass (raw);
+                    const auto g = gains[i] + (0.9999f - gains[i]) * freezeAmount;
+                    r[i] = (damped + freezeAmount * (raw - damped)) * g;
                     sum += r[i];
                 }
 
@@ -133,6 +144,7 @@ namespace vb::dsp
         std::array<float, numLines> targetLengths {}, currentLengths {};
         std::array<double, numLines> phases {};
         float targetPre = 2.0f, currentPre = 2.0f;
+        float freezeAmount = 0.0f, freezeTarget = 0.0f, freezeGlide = 0.001f;
         float decay = 3.0f, modDepth = 0.0f, lengthGlide = 0.001f, preGlide = 0.001f;
     };
 }

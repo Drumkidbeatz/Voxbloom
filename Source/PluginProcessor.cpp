@@ -7,6 +7,8 @@ using namespace vb;
 namespace
 {
     const juce::Identifier presetNameId { "presetName" };
+    const juce::String abTag { "VoxBloomAB" };
+    const juce::String uiScaleAttr { "uiScale" };
 
     std::atomic<float>* rawParam (juce::AudioProcessorValueTreeState& s, const juce::String& id)
     {
@@ -39,6 +41,12 @@ VoxBloomProcessor::VoxBloomProcessor()
             rawParam (apvts, pid::reverbDamp), rawParam (apvts, pid::reverbLowCut), rawParam (apvts, pid::reverbMod),
             rawParam (apvts, pid::reverbLevel), rawParam (apvts, pid::reverbSource),
             rawParam (apvts, pid::duckAmount), rawParam (apvts, pid::duckThreshold), rawParam (apvts, pid::duckRelease),
+            rawParam (apvts, pid::shimmerAmount), rawParam (apvts, pid::shimmerPitch), rawParam (apvts, pid::lofi),
+            rawParam (apvts, pid::reverse), rawParam (apvts, pid::reverseTime),
+            rawParam (apvts, pid::sweepMode), rawParam (apvts, pid::sweepRate), rawParam (apvts, pid::sweepDepth),
+            rawParam (apvts, pid::gateAmount), rawParam (apvts, pid::gateThreshold), rawParam (apvts, pid::gateHold),
+            rawParam (apvts, pid::freeze), rawParam (apvts, pid::throwMode), rawParam (apvts, pid::throwActive),
+            rawParam (apvts, pid::doubler),
             rawParam (apvts, pid::width), rawParam (apvts, pid::mix), rawParam (apvts, pid::output) };
 
     apvts.state.setProperty (presetNameId, factoryPresets().front().name, nullptr);
@@ -57,18 +65,29 @@ bool VoxBloomProcessor::isBusesLayoutSupported (const BusesLayout& layouts) cons
 void VoxBloomProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     maxChunk = juce::jlimit (32, 4096, samplesPerBlock);
-    scratch.setSize (6, maxChunk, false, true, false);
+    scratch.setSize (8, maxChunk, false, true, false);
 
     delay.prepare (sampleRate);
     reverb.prepare (sampleRate);
     ducker.prepare (sampleRate);
+    reverseL.prepare (sampleRate);
+    reverseR.prepare (sampleRate);
+    doubler.prepare (sampleRate);
+    sweep.prepare (sampleRate);
+    gate.prepare (sampleRate);
 
-    for (auto* s : { &delayLevel, &reverbLevel, &reverbSource, &widthAmount, &dryGain, &wetGain, &outGain })
+    const auto smoothers = { &delayLevel, &reverbLevel, &reverbSource, &widthAmount, &dryGain, &wetGain, &outGain,
+                             &sendGain, &reverseMix, &gateDepth, &doublerMix };
+    for (auto* s : smoothers)
         s->reset (sampleRate, 0.05);
+    sendGain.reset (sampleRate, 0.006);   // fast enough to catch a single word
 
     updateDspParameters();
-    for (auto* s : { &delayLevel, &reverbLevel, &reverbSource, &widthAmount, &dryGain, &wetGain, &outGain })
+    for (auto* s : smoothers)
         s->setCurrentAndTargetValue (s->getTargetValue());
+
+    scopeInterval = juce::jmax (1, (int) (sampleRate * 0.01));
+    scopeCounter = 0;
 
     reset();
 }
@@ -78,6 +97,11 @@ void VoxBloomProcessor::reset()
     delay.reset();
     reverb.reset();
     ducker.reset();
+    reverseL.reset();
+    reverseR.reset();
+    doubler.reset();
+    sweep.reset();
+    gate.reset();
 }
 
 float VoxBloomProcessor::delayTimeMs() const
@@ -108,6 +132,25 @@ void VoxBloomProcessor::updateDspParameters()
                           raw.reverbMod->load() * 0.01f);
 
     ducker.setParameters (raw.duckAmount->load() * 0.01f, raw.duckThreshold->load(), raw.duckRelease->load());
+
+    const auto frozen = raw.freeze->load() > 0.5f;
+    delay.setShimmer (raw.shimmerAmount->load() * 0.01f, shimmerSemitones ((int) raw.shimmerPitch->load()));
+    delay.setLofi (raw.lofi->load() * 0.01f);
+    delay.setFreeze (frozen);
+    reverb.setFreeze (frozen);
+    reverseL.setLength (raw.reverseTime->load());
+    reverseR.setLength (raw.reverseTime->load());
+    sweep.setParameters ((dsp::SweepFilter::Mode) (int) raw.sweepMode->load(),
+                         raw.sweepRate->load(), raw.sweepDepth->load() * 0.01f);
+    gate.setParameters (raw.gateThreshold->load(), raw.gateHold->load());
+
+    // Throw mode: the effects only hear the vocal while Throw is held.
+    const auto throwing = raw.throwMode->load() < 0.5f || raw.throwActive->load() > 0.5f;
+    sendGain.setTargetValue (throwing ? 1.0f : 0.0f);
+    reverseMix.setTargetValue (raw.reverse->load() * 0.01f);
+    // A frozen tail should not be chopped by the gate.
+    gateDepth.setTargetValue (frozen ? 0.0f : raw.gateAmount->load() * 0.01f);
+    doublerMix.setTargetValue (raw.doubler->load() * 0.01f);
 
     const auto [dry, wet] = mixGains (raw.mix->load() * 0.01f);
     delayLevel.setTargetValue (raw.delayLevel->load() * 0.01f * delay.makeupGain());
@@ -153,6 +196,8 @@ void VoxBloomProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mi
     }
 
     duckGainDisplay.store (ducker.currentGain());
+    sweepCutoffDisplay.store (raw.sweepDepth->load() > 0.0f ? sweep.currentCutoff() : 0.0f);
+    frozenDisplay.store (raw.freeze->load() > 0.5f);
 }
 
 void VoxBloomProcessor::processChunk (float* left, float* right, int n, bool isMono)
@@ -163,14 +208,24 @@ void VoxBloomProcessor::processChunk (float* left, float* right, int n, bool isM
     auto* iR = scratch.getWritePointer (3);
     auto* vL = scratch.getWritePointer (4);
     auto* vR = scratch.getWritePointer (5);
+    auto* sL = scratch.getWritePointer (6);
+    auto* sR = scratch.getWritePointer (7);
 
-    delay.process (left, right, dL, dR, n);
+    // What the effects hear: the vocal, or nothing outside a throw.
+    for (int i = 0; i < n; ++i)
+    {
+        const auto send = sendGain.getNextValue();
+        sL[i] = left[i] * send;
+        sR[i] = right[i] * send;
+    }
+
+    delay.process (sL, sR, dL, dR, n);
 
     for (int i = 0; i < n; ++i)
     {
         const auto src = reverbSource.getNextValue();
-        iL[i] = left[i]  * (1.0f - src) + dL[i] * src;
-        iR[i] = right[i] * (1.0f - src) + dR[i] * src;
+        iL[i] = sL[i] * (1.0f - src) + dL[i] * src;
+        iR[i] = sR[i] * (1.0f - src) + dR[i] * src;
     }
 
     reverb.process (iL, iR, vL, vR, n);
@@ -183,9 +238,26 @@ void VoxBloomProcessor::processChunk (float* left, float* right, int n, bool isM
         const auto dry  = dryGain.getNextValue();
         const auto wet  = wetGain.getNextValue();
         const auto out  = outGain.getNextValue();
+        const auto rev  = reverseMix.getNextValue();
+        const auto gd   = gateDepth.getNextValue();
+        const auto dbl  = doublerMix.getNextValue();
 
-        auto wL = dL[i] * dLev + vL[i] * rLev;
-        auto wR = dR[i] * dLev + vR[i] * rLev;
+        const auto detector = juce::jmax (std::abs (left[i]), std::abs (right[i]));
+
+        // Reverse swell: the reverb played backwards in chunks.
+        auto rvL = vL[i], rvR = vR[i];
+        const auto bL = reverseL.process (rvL);
+        const auto bR = reverseR.process (rvR);
+        rvL += rev * (bL - rvL);
+        rvR += rev * (bR - rvR);
+
+        // Gate on the reverb: open with the vocal, cut after the hold time.
+        const auto gateGain = 1.0f - gd * (1.0f - gate.process (detector));
+
+        auto wL = dL[i] * dLev + rvL * rLev * gateGain;
+        auto wR = dR[i] * dLev + rvR * rLev * gateGain;
+
+        sweep.process (wL, wR, detector);
 
         // Mid/side width on the wet signal only; the vocal itself stays centred.
         const auto mid  = 0.5f * (wL + wR);
@@ -193,17 +265,42 @@ void VoxBloomProcessor::processChunk (float* left, float* right, int n, bool isM
         wL = mid + side;
         wR = mid - side;
 
-        const auto duck = ducker.process (juce::jmax (std::abs (left[i]), std::abs (right[i])));
+        const auto duck = ducker.process (detector);
         const auto wetGainNow = wet * duck;
+
+        // Doubler: two detuned copies of the vocal, panned hard left and right.
+        float xL = left[i], xR = right[i];
+        float dblL, dblR;
+        doubler.process (xL, xR, dblL, dblR);
+        xL += dbl * 0.7f * dblL;
+        xR += dbl * 0.7f * dblR;
+
+        const auto peakDry = detector * dry;
+        float peakWet;
 
         if (isMono)
         {
-            left[i] = (left[i] * dry + 0.5f * (wL + wR) * wetGainNow) * out;
+            const auto wetMono = 0.5f * (wL + wR) * wetGainNow;
+            left[i] = (0.5f * (xL + xR) * dry + wetMono) * out;
+            peakWet = std::abs (wetMono);
         }
         else
         {
-            left[i]  = (left[i]  * dry + wL * wetGainNow) * out;
-            right[i] = (right[i] * dry + wR * wetGainNow) * out;
+            left[i]  = (xL * dry + wL * wetGainNow) * out;
+            right[i] = (xR * dry + wR * wetGainNow) * out;
+            peakWet = juce::jmax (std::abs (wL), std::abs (wR)) * wetGainNow;
+        }
+
+        scopePeakDry = juce::jmax (scopePeakDry, peakDry * out);
+        scopePeakWet = juce::jmax (scopePeakWet, peakWet * out);
+        if (++scopeCounter >= scopeInterval)
+        {
+            const auto pos = scopeWrite.load (std::memory_order_relaxed);
+            scopeDry[(size_t) pos].store (scopePeakDry, std::memory_order_relaxed);
+            scopeWet[(size_t) pos].store (scopePeakWet, std::memory_order_relaxed);
+            scopeWrite.store ((pos + 1) % scopeSize, std::memory_order_release);
+            scopeCounter = 0;
+            scopePeakDry = scopePeakWet = 0.0f;
         }
     }
 }
@@ -284,18 +381,79 @@ juce::String VoxBloomProcessor::getCurrentPresetName() const
     return apvts.state.getProperty (presetNameId).toString();
 }
 
+void VoxBloomProcessor::switchToSlot (int slot)
+{
+    slot = juce::jlimit (0, 1, slot);
+    if (slot == activeSlot)
+        return;
+
+    slots[(size_t) activeSlot] = apvts.copyState();
+    activeSlot = slot;
+
+    // A slot that was never used starts as a copy of the other one.
+    if (slots[(size_t) slot].isValid())
+        apvts.replaceState (slots[(size_t) slot].createCopy());
+}
+
+void VoxBloomProcessor::copyActiveSlotToOther()
+{
+    slots[(size_t) (1 - activeSlot)] = apvts.copyState();
+}
+
 void VoxBloomProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
-    if (auto xml = state.createXml())
-        copyXmlToBinary (*xml, destData);
+    auto xml = state.createXml();
+    if (xml == nullptr)
+        return;
+
+    // Momentary controls should not come back "pressed" when a session is reopened.
+    for (auto* child : xml->getChildIterator())
+        if (child->getStringAttribute ("id") == pid::throwActive)
+            child->setAttribute ("value", 0.0);
+
+    xml->setAttribute (uiScaleAttr, (double) editorScale);
+
+    auto* ab = xml->createNewChildElement (abTag);
+    ab->setAttribute ("active", activeSlot);
+    for (size_t i = 0; i < slots.size(); ++i)
+        if (slots[i].isValid() && (int) i != activeSlot)
+            if (auto slotXml = slots[i].createXml())
+            {
+                slotXml->setAttribute ("slot", (int) i);
+                ab->addChildElement (slotXml.release());
+            }
+
+    copyXmlToBinary (*xml, destData);
 }
 
 void VoxBloomProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    if (auto xml = getXmlFromBinary (data, sizeInBytes))
-        if (xml->hasTagName (apvts.state.getType()))
-            apvts.replaceState (juce::ValueTree::fromXml (*xml));
+    auto xml = getXmlFromBinary (data, sizeInBytes);
+    if (xml == nullptr || ! xml->hasTagName (apvts.state.getType()))
+        return;
+
+    editorScale = juce::jlimit (0.6f, 2.0f, (float) xml->getDoubleAttribute (uiScaleAttr, editorScale));
+    xml->removeAttribute (uiScaleAttr);
+
+    slots = {};
+    activeSlot = 0;
+    if (auto* ab = xml->getChildByName (abTag))
+    {
+        activeSlot = juce::jlimit (0, 1, ab->getIntAttribute ("active"));
+        for (auto* slotXml : ab->getChildIterator())
+        {
+            const auto index = slotXml->getIntAttribute ("slot", -1);
+            if (index == 0 || index == 1)
+            {
+                slotXml->removeAttribute ("slot");
+                slots[(size_t) index] = juce::ValueTree::fromXml (*slotXml);
+            }
+        }
+        xml->removeChildElement (ab, true);
+    }
+
+    apvts.replaceState (juce::ValueTree::fromXml (*xml));
 }
 
 //==============================================================================

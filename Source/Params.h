@@ -32,6 +32,27 @@ namespace vb
         inline const juce::String duckThreshold  { "duckThreshold" };
         inline const juce::String duckRelease    { "duckRelease" };
 
+        inline const juce::String shimmerAmount  { "shimmerAmount" };
+        inline const juce::String shimmerPitch   { "shimmerPitch" };
+        inline const juce::String lofi           { "lofi" };
+
+        inline const juce::String reverse        { "reverse" };
+        inline const juce::String reverseTime    { "reverseTime" };
+
+        inline const juce::String sweepMode      { "sweepMode" };
+        inline const juce::String sweepRate      { "sweepRate" };
+        inline const juce::String sweepDepth     { "sweepDepth" };
+
+        inline const juce::String gateAmount     { "gateAmount" };
+        inline const juce::String gateThreshold  { "gateThreshold" };
+        inline const juce::String gateHold       { "gateHold" };
+
+        inline const juce::String freeze         { "freeze" };
+        inline const juce::String throwMode      { "throwMode" };
+        inline const juce::String throwActive    { "throwActive" };
+
+        inline const juce::String doubler        { "doubler" };
+
         inline const juce::String width          { "width" };
         inline const juce::String mix            { "mix" };
         inline const juce::String output         { "output" };
@@ -44,4 +65,7 @@ namespace vb
     const juce::StringArray& noteDivisionNames();
     double noteDivisionInBeats (int index);
     const juce::StringArray& delayModeNames();
+    const juce::StringArray& shimmerPitchNames();
+    float shimmerSemitones (int index);
+    const juce::StringArray& sweepModeNames();
 }

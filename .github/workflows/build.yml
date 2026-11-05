@@ -2,6 +2,8 @@ name: Build
 
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -37,6 +39,11 @@ jobs:
             libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxi-dev \
             libxinerama-dev libxrandr-dev libxrender-dev libgl1-mesa-dev libegl-dev
 
+      - name: Version
+        id: version
+        shell: bash
+        run: echo "version=$(sed -n 's/^project(VoxBloom VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)" >> "$GITHUB_OUTPUT"
+
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.configure }}
 
@@ -49,16 +56,64 @@ jobs:
           exe=$(find build -type f \( -name VoxBloomTests -o -name VoxBloomTests.exe \) -path "*Release*" | head -1)
           "$exe"
 
-      - name: Collect plugins
-        shell: bash
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_DEV_ID_APP: ${{ secrets.MACOS_DEV_ID_APP }}
+          MACOS_DEV_ID_INSTALLER: ${{ secrets.MACOS_DEV_ID_INSTALLER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: packaging/package-macos.sh "${{ steps.version.outputs.version }}" build/VoxBloom_artefacts/Release dist
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          mkdir -p dist
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          $src = (Resolve-Path build/VoxBloom_artefacts/Release).Path
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $out = (Resolve-Path dist).Path
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceDir=$src" "/DOutputDir=$out" packaging/VoxBloom.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zipDir = "VoxBloom-${{ steps.version.outputs.version }}-Windows"
+          New-Item -ItemType Directory -Force $zipDir | Out-Null
+          Copy-Item -Recurse "$src/VST3/VoxBloom.vst3" $zipDir
+          Copy-Item "$src/Standalone/VoxBloom.exe" $zipDir
+          Compress-Archive -Path $zipDir -DestinationPath "dist/$zipDir.zip"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          name=VoxBloom-${{ steps.version.outputs.version }}-Linux
           art=build/VoxBloom_artefacts/Release
-          cp -R "$art/VST3/VoxBloom.vst3" dist/
-          if [ -d "$art/AU" ]; then cp -R "$art/AU/VoxBloom.component" dist/; fi
-          if [ -d "$art/Standalone" ]; then cp -R "$art/Standalone/"* dist/; fi
+          mkdir -p "$name" dist
+          cp -R "$art/VST3/VoxBloom.vst3" "$art/Standalone/VoxBloom" "$name/"
+          tar -czf "dist/$name.tar.gz" "$name"
 
       - uses: actions/upload-artifact@v4
         with:
           name: VoxBloom-${{ matrix.name }}
           path: dist
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

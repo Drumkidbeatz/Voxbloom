@@ -22,7 +22,7 @@ VoxLookAndFeel::VoxLookAndFeel()
     setColour (PopupMenu::headerTextColourId, colours::accent);
     setColour (TextButton::buttonColourId, colours::panel);
     setColour (TextButton::textColourOffId, colours::text);
-    setColour (TextButton::textColourOnId, colours::text);
+    setColour (TextButton::textColourOnId, colours::background);
     setColour (TextEditor::backgroundColourId, colours::background);
     setColour (TextEditor::textColourId, colours::text);
     setColour (TextEditor::outlineColourId, colours::panelEdge);
@@ -83,7 +83,7 @@ void VoxLookAndFeel::drawToggleButton (juce::Graphics& g, juce::ToggleButton& b,
     g.setColour (on ? colours::accent : (highlighted ? colours::accent.withAlpha (0.6f) : colours::panelEdge));
     g.drawRoundedRectangle (r, 6.0f, 1.2f);
     g.setColour (on ? colours::background : colours::textDim);
-    g.setFont (FontOptions (12.0f, Font::bold));
+    g.setFont (FontOptions (r.getHeight() > 40.0f ? 14.0f : 12.0f, Font::bold));
     g.drawText (b.getButtonText(), r, Justification::centred);
 }
 
@@ -91,9 +91,13 @@ void VoxLookAndFeel::drawButtonBackground (juce::Graphics& g, juce::Button& b, c
                                            bool highlighted, bool down)
 {
     const auto r = b.getLocalBounds().toFloat().reduced (1.0f);
-    g.setColour (down ? colours::accent.withAlpha (0.5f) : colours::panel);
+    const auto on = b.getToggleState();
+    if (on)
+        g.setGradientFill (juce::ColourGradient (colours::accent, r.getX(), r.getY(), colours::accent2, r.getRight(), r.getBottom(), false));
+    else
+        g.setColour (down ? colours::accent.withAlpha (0.5f) : colours::panel);
     g.fillRoundedRectangle (r, 6.0f);
-    g.setColour (highlighted ? colours::accent : colours::panelEdge);
+    g.setColour (on || highlighted ? colours::accent : colours::panelEdge);
     g.drawRoundedRectangle (r, 6.0f, 1.2f);
 }
 
